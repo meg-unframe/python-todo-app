@@ -13,10 +13,33 @@ def repo():
     return MemoryTodoRepository()
 
 
+PASSWORD = "test-password-123"
+
+
+def login(client, password=PASSWORD, next_url=None):
+    html = client.get("/login").get_data(as_text=True)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
+    data = {"password": password, "csrf_token": token}
+    if next_url is not None:
+        data["next"] = next_url
+    return client.post("/login", data=data)
+
+
 @pytest.fixture
-def client(repo):
-    app = create_app(repository=repo, config={"TESTING": True})
+def app(repo):
+    return create_app(repository=repo, config={"TESTING": True})
+
+
+@pytest.fixture
+def anon_client(app):
     return app.test_client()
+
+
+@pytest.fixture
+def client(app):
+    c = app.test_client()
+    assert login(c).status_code == 302
+    return c
 
 
 def today():
@@ -270,6 +293,80 @@ def test_missing_secret_key_raises(monkeypatch):
         create_app(repository=MemoryTodoRepository())
 
 
+@pytest.mark.parametrize("password", ["", "short"])
+def test_missing_or_short_app_password_raises(monkeypatch, password):
+    monkeypatch.setenv("APP_PASSWORD", password)
+    with pytest.raises(RuntimeError):
+        create_app(repository=MemoryTodoRepository())
+
+
+# ---------- ログイン ----------
+
+
+@pytest.mark.parametrize("path", ["/", "/todos/new", "/todos/abc/edit", "/todos/abc/delete"])
+def test_pages_require_login(anon_client, path):
+    res = anon_client.get(path)
+    assert res.status_code == 302
+    assert "/login" in res.headers["Location"]
+
+
+def test_post_requires_login(anon_client, repo):
+    login_page = anon_client.get("/login").get_data(as_text=True)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', login_page).group(1)
+    res = anon_client.post(
+        "/todos/new",
+        data={"title": "x", "category": "home", "priority": "low", "csrf_token": token},
+    )
+    assert res.status_code == 302
+    assert repo.list() == []
+
+
+def test_static_is_public(anon_client):
+    assert anon_client.get("/static/style.css").status_code == 200
+
+
+def test_login_success_redirects_to_next(anon_client):
+    res = login(anon_client, next_url="/?status=all")
+    assert res.status_code == 302
+    assert res.headers["Location"].endswith("/?status=all")
+    assert anon_client.get("/").status_code == 200
+
+
+def test_login_rejects_external_next(anon_client):
+    res = login(anon_client, next_url="//evil.example.com/")
+    assert res.headers["Location"] == "/"
+
+
+def test_login_wrong_password(anon_client):
+    res = login(anon_client, password="wrong-password")
+    assert res.status_code == 401
+    assert "パスワードが正しくありません" in res.get_data(as_text=True)
+    assert anon_client.get("/").status_code == 302
+
+
+def test_login_lockout_after_failures(anon_client):
+    for _ in range(5):
+        login(anon_client, password="wrong-password")
+    res = login(anon_client)  # 正しいパスワードでもロック中は入れない
+    assert res.status_code == 429
+    assert "一時的にロック" in res.get_data(as_text=True)
+    assert anon_client.get("/").status_code == 302
+
+
+def test_logout(client):
+    token = get_csrf(client)
+    res = client.post("/logout", data={"csrf_token": token})
+    assert res.status_code == 302
+    assert client.get("/").status_code == 302
+
+
+def test_session_cookie_flags(anon_client):
+    res = anon_client.get("/login")
+    cookie = res.headers.get("Set-Cookie", "")
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+
+
 # ---------- スプレッドシート保存（Google APIの代わりに偽のシートを使用） ----------
 
 
@@ -349,3 +446,9 @@ def test_sheets_repository_rejects_unexpected_header():
     ws = FakeWorksheet(rows=[["name", "memo"]])
     with pytest.raises(RuntimeError):
         make_sheets_repo(ws)
+
+
+def test_secure_cookie_on_render(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    app = create_app(repository=MemoryTodoRepository())
+    assert app.config["SESSION_COOKIE_SECURE"] is True

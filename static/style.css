@@ -54,6 +54,10 @@ main.container { padding-top: 16px; padding-bottom: 48px; }
 }
 .brand { color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; }
 .site-header .btn-primary { background: #fff; color: var(--primary); border-color: #fff; }
+.header-actions { display: flex; align-items: center; gap: 8px; }
+.header-actions form { margin: 0; }
+.btn-ghost { background: transparent; color: #fff; border-color: rgba(255, 255, 255, 0.6); }
+.login-panel { max-width: 420px; margin: 24px auto 0; }
 
 /* ボタン */
 .btn {
@@ -107,7 +111,7 @@ main.container { padding-top: 16px; padding-bottom: 48px; }
 .filters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
 .filters label { display: flex; flex-direction: column; font-size: 0.8rem; color: var(--muted); gap: 2px; }
 
-select, input[type="text"], input[type="date"], textarea {
+select, input[type="text"], input[type="password"], input[type="date"], textarea {
   width: 100%;
   min-height: 44px;
   padding: 8px 12px;

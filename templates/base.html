@@ -11,7 +11,15 @@
   <header class="site-header">
     <div class="container header-inner">
       <a class="brand" href="{{ url_for('index') }}">Life &amp; Work TODO</a>
-      <a class="btn btn-primary btn-sm" href="{{ url_for('create') }}">＋ 新規登録</a>
+      {% if session.logged_in %}
+      <div class="header-actions">
+        <a class="btn btn-primary btn-sm" href="{{ url_for('create') }}">＋ 新規登録</a>
+        <form method="post" action="{{ url_for('logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-sm btn-ghost" type="submit">ログアウト</button>
+        </form>
+      </div>
+      {% endif %}
     </div>
   </header>
 

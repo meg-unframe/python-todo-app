@@ -1,9 +1,12 @@
 """Life & Work TODO — Flaskアプリ本体。"""
 
+import hashlib
 import os
 import secrets
+import threading
+import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -18,6 +21,7 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from storage import create_repository_from_env
 
@@ -35,14 +39,28 @@ PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 TITLE_MAX = 100
 CONTENT_MAX = 2000
 
+# ログイン失敗が続いたときの一時ロック（総当たり対策）
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCK_SECONDS = 15 * 60
+
+
+def _env_flag(name, default):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
 
 def create_app(repository=None, config=None):
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", ""),
+        APP_PASSWORD=os.environ.get("APP_PASSWORD", ""),
         APP_TIMEZONE=os.environ.get("APP_TIMEZONE", "Asia/Tokyo"),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        # Render上（HTTPS）では自動でSecure属性を付ける
+        SESSION_COOKIE_SECURE=_env_flag(
+            "SESSION_COOKIE_SECURE", "1" if os.environ.get("RENDER") else "0"
+        ),
+        PERMANENT_SESSION_LIFETIME=timedelta(days=30),
         MAX_CONTENT_LENGTH=64 * 1024,
     )
     if config:
@@ -52,6 +70,15 @@ def create_app(repository=None, config=None):
         raise RuntimeError(
             "SECRET_KEY が未設定です。.env または環境変数に長いランダム値を設定してください。"
         )
+    if len(app.config["APP_PASSWORD"]) < 8:
+        raise RuntimeError(
+            "APP_PASSWORD が未設定か短すぎます。.env または環境変数に8文字以上のパスワードを設定してください。"
+        )
+
+    # Renderなどのプロキシ経由でも、利用者のIPアドレスとHTTPSを正しく扱う
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+    app.extensions["login_failures"] = {}
+    app.extensions["login_lock"] = threading.Lock()
 
     # 保存先は最初のリクエスト時に接続する（起動時にGoogleへ接続しないため）
     app.extensions["todo_repository"] = repository
@@ -92,6 +119,39 @@ def csrf_token():
         token = secrets.token_urlsafe(32)
         session["csrf_token"] = token
     return token
+
+
+def password_matches(entered):
+    # 長さの違いから推測されないよう、ハッシュ同士を一定時間で比較する
+    expected = hashlib.sha256(current_app.config["APP_PASSWORD"].encode()).digest()
+    return secrets.compare_digest(hashlib.sha256(entered.encode()).digest(), expected)
+
+
+def login_locked_seconds(ip):
+    with current_app.extensions["login_lock"]:
+        count, locked_until = current_app.extensions["login_failures"].get(ip, (0, 0))
+    return max(0, int(locked_until - time.time()))
+
+
+def record_login_failure(ip):
+    with current_app.extensions["login_lock"]:
+        failures = current_app.extensions["login_failures"]
+        count, _ = failures.get(ip, (0, 0))
+        count += 1
+        locked_until = time.time() + LOGIN_LOCK_SECONDS if count >= LOGIN_MAX_FAILURES else 0
+        failures[ip] = (0 if locked_until else count, locked_until)
+
+
+def clear_login_failures(ip):
+    with current_app.extensions["login_lock"]:
+        current_app.extensions["login_failures"].pop(ip, None)
+
+
+def safe_local_path(value):
+    """同じサイト内のパスだけを許可する（外部URLへのリダイレクト防止）。"""
+    if value and value.startswith("/") and not value.startswith("//") and "\\" not in value:
+        return value
+    return None
 
 
 def validate_form(form):
@@ -170,6 +230,45 @@ def register_routes(app):
             expected = session.get("csrf_token", "")
             if not expected or not secrets.compare_digest(sent, expected):
                 abort(400, description="フォームの有効期限が切れました。画面を再読み込みしてやり直してください。")
+
+    @app.before_request
+    def require_login():
+        if request.endpoint in ("login", "static") or session.get("logged_in"):
+            return None
+        return redirect(url_for("login", next=request.full_path.rstrip("?")))
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if session.get("logged_in"):
+            return redirect(url_for("index"))
+        next_url = safe_local_path(request.values.get("next", "")) or url_for("index")
+        error = None
+        status = 200
+        if request.method == "POST":
+            ip = request.remote_addr or "unknown"
+            wait = login_locked_seconds(ip)
+            if wait:
+                error = f"ログインの失敗が続いたため、一時的にロックしています。約{wait // 60 + 1}分後にお試しください。"
+                status = 429
+            elif password_matches(request.form.get("password", "")):
+                clear_login_failures(ip)
+                token = session.get("csrf_token")
+                session.clear()  # セッション固定化対策
+                session["csrf_token"] = token or secrets.token_urlsafe(32)
+                session["logged_in"] = True
+                session.permanent = True
+                return redirect(next_url)
+            else:
+                record_login_failure(ip)
+                error = "パスワードが正しくありません。"
+                status = 401
+        return render_template("login.html", error=error, next_url=next_url), status
+
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        flash("ログアウトしました。", "success")
+        return redirect(url_for("login"))
 
     @app.get("/")
     def index():
@@ -303,10 +402,7 @@ def register_routes(app):
 
 def safe_next_url():
     """一覧の絞り込み状態を保ったまま戻る。外部URLへは飛ばさない。"""
-    next_url = request.form.get("next", "")
-    if next_url.startswith("/") and not next_url.startswith("//") and "\\" not in next_url:
-        return next_url
-    return url_for("index")
+    return safe_local_path(request.form.get("next", "")) or url_for("index")
 
 
 app = create_app()

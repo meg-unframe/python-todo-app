@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}ログイン | Life & Work TODO{% endblock %}
+{% block content %}
+<section class="panel login-panel">
+  <h1 class="page-title">ログイン</h1>
+
+  {% if error %}
+  <div class="errors" role="alert"><ul><li>{{ error }}</li></ul></div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('login') }}" class="todo-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <div class="field">
+      <label for="password">パスワード</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">ログイン</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

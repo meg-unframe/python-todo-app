@@ -22,6 +22,7 @@
 - 期日順の表示（期日なしは末尾）
 - 期限切れ・今日が期日の表示
 - スマホでも見やすい日本語画面（レスポンシブ）
+- パスワードログイン（APP_PASSWORD。5回失敗で15分ロック）
 
 ### スプレッドシートの列（1行目がヘッダー）
 `id, title, content, due_date, category, priority, completed, created_at, updated_at`
@@ -50,12 +51,14 @@
 │   ├── index.html        # 一覧ページ
 │   ├── form.html         # 新規登録・編集フォーム
 │   ├── confirm_delete.html # 削除確認
+│   ├── login.html        # ログイン
 │   └── error.html        # エラー表示
 ├── static/style.css      # スタイル（スマホ対応）
 ├── tests/test_app.py     # 自動テスト（メモリ保存で実行）
 ├── requirements.txt      # 本番用依存パッケージ
 ├── requirements-dev.txt  # 開発・テスト用依存パッケージ
 ├── Procfile              # 公開用起動コマンド（gunicorn）
+├── .python-version       # Render で使う Python のバージョン
 ├── .env.example          # 環境変数の見本（秘密情報なし）
 ├── .gitignore            # .env / credentials.json などを除外
 └── .claude/settings.json # Claude Code の権限設定
@@ -66,6 +69,9 @@
 - `.env` と `credentials.json`（およびサービスアカウント鍵JSON）は `.gitignore` 済み。絶対にコミット・pushしない。
 - `.env.example` にはダミー値のみを書く。
 - 本番では `SECRET_KEY` を必ず長いランダム値にする（未設定時は起動エラー）。
+- 全ページにログインが必要（`APP_PASSWORD`、8文字以上。未設定時は起動エラー）。ログイン失敗が5回続くと、そのIPを15分ロックする。
+- Render上ではセッションCookieに Secure 属性を自動で付ける（`RENDER` 環境変数で判定）。
+- リポジトリは GitHub で公開（public）されているため、秘密情報は絶対にコミットしない。
 - フォームのPOSTにはCSRFトークンを付与して検証する。
 - スプレッドシートへの書き込みは `RAW` で行い、`=` で始まる入力が数式として実行されないようにする。
 - 完了切替・削除はPOSTのみ受け付ける。
@@ -75,12 +81,14 @@
 | 名前 | 説明 |
 |---|---|
 | `SECRET_KEY` | Flaskのセッション署名キー（必須） |
+| `APP_PASSWORD` | ログイン用パスワード（必須・8文字以上） |
 | `STORAGE_BACKEND` | `sheets`（既定）または `memory`（動作確認用・再起動で消える） |
 | `SPREADSHEET_ID` | 保存先スプレッドシートのID |
 | `WORKSHEET_NAME` | シート名（既定: `todos`。無ければ自動作成） |
 | `GOOGLE_APPLICATION_CREDENTIALS` | サービスアカウント鍵JSONのファイルパス（ローカル向け） |
 | `GOOGLE_CREDENTIALS_JSON` | 鍵JSONの中身そのもの（ファイルを置けないサーバー向け） |
 | `APP_TIMEZONE` | 期限判定のタイムゾーン（既定: `Asia/Tokyo`） |
+| `SESSION_COOKIE_SECURE` | `1` でCookieをHTTPS限定にする（Render上では自動で `1`） |
 
 ## 開発・起動方法
 ```bash
@@ -97,13 +105,16 @@ Google未設定で画面だけ確認したい場合は `.env` で `STORAGE_BACKE
 python -m pytest -v
 ```
 テストはメモリ保存で実行するため、Googleの認証情報は不要。
-登録・一覧・編集・完了切替・削除・入力チェック・期限切れ表示・期日順・CSRFを確認する。
+登録・一覧・編集・完了切替・削除・入力チェック・期限切れ表示・期日順・CSRF・ログイン（ロック、ログアウト、外部URLへのリダイレクト防止）を確認する。
 
-## 公開方法（例: Render）
-1. GitHubへpush（`.env` と鍵JSONが含まれていないことを `git status` で確認）
-2. Renderで「New Web Service」→ リポジトリを選択
+## 公開方法（Render）
+1. GitHub（public リポジトリ `meg-unframe/python-todo-app`）へ push する。`.env` と鍵JSONが含まれていないことを `git status` で確認する。
+2. Render で「New」→「Web Service」→ GitHub リポジトリを選択する。
 3. Build Command: `pip install -r requirements.txt`
-4. Start Command: `gunicorn app:app`（Procfileと同じ）
-5. Environment に `SECRET_KEY`, `SPREADSHEET_ID`, `GOOGLE_CREDENTIALS_JSON`（鍵JSONの中身）などを設定
-
-Railway・Heroku系など Procfile 対応のサービスでも同様に公開できる。
+4. Start Command: `gunicorn app:app`（Procfileと同じ。ポートは Render の `PORT` を gunicorn が自動で使う）
+5. Environment に次を設定する。
+   - `SECRET_KEY`（ローカルとは別の新しいランダム値）
+   - `APP_PASSWORD`
+   - `STORAGE_BACKEND=sheets`、`SPREADSHEET_ID`、`WORKSHEET_NAME=todos`、`APP_TIMEZONE=Asia/Tokyo`
+   - 認証情報は Secret Files に `credentials.json` をアップロードし、`GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/credentials.json` を設定する（`GOOGLE_CREDENTIALS_JSON` に中身を入れる方法でも可）。
+6. デプロイ後、ログイン → 登録 → 編集 → 完了切替 → 削除を確認する。
