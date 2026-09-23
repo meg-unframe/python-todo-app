@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}削除の確認 | Life & Work TODO{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1 class="page-title">このTodoを削除しますか？</h1>
+  <div class="confirm-box">
+    <p class="todo-title">{{ todo.title }}</p>
+    <p class="muted">{{ todo.category_label }} ／ 優先度：{{ todo.priority_label }}{% if todo.due %} ／ 期日：{{ todo.due.year }}年{{ todo.due.month }}月{{ todo.due.day }}日{% endif %}</p>
+  </div>
+  <p class="muted">削除すると元に戻せません。</p>
+  <form method="post" class="form-actions">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <a class="btn" href="{{ url_for('index') }}">キャンセル</a>
+    <button class="btn btn-danger" type="submit">削除する</button>
+  </form>
+</section>
+{% endblock %}

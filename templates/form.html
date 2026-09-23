@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ '新規登録' if mode == 'new' else '編集' }} | Life & Work TODO{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1 class="page-title">{{ 'やることを登録' if mode == 'new' else 'やることを編集' }}</h1>
+
+  {% if errors %}
+  <div class="errors" role="alert">
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <form method="post" class="todo-form" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div class="field">
+      <label for="title">タイトル <span class="required">必須</span></label>
+      <input id="title" name="title" type="text" maxlength="100" required value="{{ todo.title }}" placeholder="例：予約表の確認" autofocus>
+    </div>
+
+    <div class="field">
+      <label for="content">内容</label>
+      <textarea id="content" name="content" rows="5" maxlength="2000" placeholder="詳しいメモ（任意）">{{ todo.content }}</textarea>
+    </div>
+
+    <div class="field">
+      <label for="due_date">期日</label>
+      <input id="due_date" name="due_date" type="date" value="{{ todo.due_date }}">
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <label for="category">カテゴリ</label>
+        <select id="category" name="category">
+          {% for key, label in CATEGORIES.items() %}
+            <option value="{{ key }}" {% if todo.category == key %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="priority">優先度</label>
+        <select id="priority" name="priority">
+          {% for key, label in PRIORITIES.items() %}
+            <option value="{{ key }}" {% if todo.priority == key %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <a class="btn" href="{{ url_for('index') }}">キャンセル</a>
+      <button class="btn btn-primary" type="submit">{{ '登録する' if mode == 'new' else '更新する' }}</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

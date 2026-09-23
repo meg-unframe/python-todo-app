@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest *)",
+      "Bash(python3 -m pytest *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/pip install -r requirements*.txt)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.local)",
+      "Read(./.env.production)",
+      "Read(./credentials.json)",
+      "Read(./**/*service-account*.json)",
+      "Edit(./.env)",
+      "Edit(./credentials.json)",
+      "Bash(cat .env*)",
+      "Bash(cat credentials.json)",
+      "Bash(git push *)",
+      "Bash(rm -rf *)",
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ]
+  }
+}

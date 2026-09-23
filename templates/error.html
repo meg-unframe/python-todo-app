@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}エラー | Life & Work TODO{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1 class="page-title">エラー（{{ code }}）</h1>
+  <p>{{ message }}</p>
+  <p><a class="btn" href="{{ url_for('index') }}">一覧へ戻る</a></p>
+</section>
+{% endblock %}

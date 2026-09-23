@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="summary" aria-label="集計">
+  <div class="summary-item"><span class="summary-num">{{ summary.open }}</span><span>未完了</span></div>
+  <div class="summary-item {% if summary.today %}is-today{% endif %}"><span class="summary-num">{{ summary.today }}</span><span>今日まで</span></div>
+  <div class="summary-item {% if summary.overdue %}is-overdue{% endif %}"><span class="summary-num">{{ summary.overdue }}</span><span>期限切れ</span></div>
+</section>
+
+<form class="filters" method="get" action="{{ url_for('index') }}">
+  <label>カテゴリ
+    <select name="category" onchange="this.form.submit()">
+      <option value="">すべて</option>
+      {% for key, label in CATEGORIES.items() %}
+        <option value="{{ key }}" {% if filters.category == key %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>状態
+    <select name="status" onchange="this.form.submit()">
+      <option value="open" {% if filters.status == 'open' %}selected{% endif %}>未完了</option>
+      <option value="done" {% if filters.status == 'done' %}selected{% endif %}>完了</option>
+      <option value="all" {% if filters.status == 'all' %}selected{% endif %}>すべて</option>
+    </select>
+  </label>
+  <label>並び順
+    <select name="sort" onchange="this.form.submit()">
+      <option value="due" {% if filters.sort == 'due' %}selected{% endif %}>期日が近い順</option>
+      <option value="priority" {% if filters.sort == 'priority' %}selected{% endif %}>優先度順</option>
+      <option value="created" {% if filters.sort == 'created' %}selected{% endif %}>登録が新しい順</option>
+    </select>
+  </label>
+  <noscript><button class="btn btn-sm" type="submit">表示</button></noscript>
+</form>
+
+{% if todos %}
+<ul class="todo-list">
+  {% for todo in todos %}
+  <li class="todo-card priority-{{ todo.priority }}{% if todo.completed %} is-completed{% endif %}{% if todo.is_overdue %} is-overdue{% endif %}{% if todo.is_due_today %} is-today{% endif %}">
+    <form method="post" action="{{ url_for('toggle', todo_id=todo.id) }}" class="toggle-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ request.full_path }}">
+      <button type="submit" class="check" aria-label="{{ '未完了に戻す' if todo.completed else '完了にする' }}" title="{{ '未完了に戻す' if todo.completed else '完了にする' }}">
+        {% if todo.completed %}✓{% endif %}
+      </button>
+    </form>
+
+    <div class="todo-body">
+      <div class="todo-meta">
+        <span class="badge badge-cat cat-{{ todo.category }}">{{ todo.category_label }}</span>
+        <span class="badge badge-pri pri-{{ todo.priority }}">優先度：{{ todo.priority_label }}</span>
+        {% if todo.is_overdue %}<span class="badge badge-overdue">期限切れ</span>{% endif %}
+        {% if todo.is_due_today %}<span class="badge badge-today">今日まで</span>{% endif %}
+        {% if todo.completed %}<span class="badge badge-done">完了</span>{% endif %}
+      </div>
+      <h2 class="todo-title">{{ todo.title }}</h2>
+      {% if todo.content %}<p class="todo-content">{{ todo.content }}</p>{% endif %}
+      <p class="todo-due">
+        {% if todo.due %}
+          期日：{{ todo.due.year }}年{{ todo.due.month }}月{{ todo.due.day }}日
+          {% if not todo.completed %}
+            {% if todo.days_left < 0 %}<span class="due-note overdue">（{{ -todo.days_left }}日超過）</span>
+            {% elif todo.days_left == 0 %}<span class="due-note today">（今日）</span>
+            {% else %}<span class="due-note">（あと{{ todo.days_left }}日）</span>{% endif %}
+          {% endif %}
+        {% else %}
+          期日：なし
+        {% endif %}
+      </p>
+    </div>
+
+    <div class="todo-actions">
+      <a class="btn btn-sm" href="{{ url_for('edit', todo_id=todo.id) }}">編集</a>
+      <a class="btn btn-sm btn-danger-outline" href="{{ url_for('delete', todo_id=todo.id) }}">削除</a>
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<div class="empty">
+  <p>表示するTodoはありません。</p>
+  <a class="btn btn-primary" href="{{ url_for('create') }}">＋ やることを登録する</a>
+</div>
+{% endif %}
+{% endblock %}
