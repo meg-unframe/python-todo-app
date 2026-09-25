@@ -1,5 +1,6 @@
 """Life & Work TODO — Flaskアプリ本体。"""
 
+import calendar
 import hashlib
 import os
 import secrets
@@ -35,6 +36,7 @@ CATEGORIES = {
 }
 PRIORITIES = {"high": "高", "medium": "中", "low": "低"}
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+REPEATS = {"none": "なし", "daily": "毎日", "weekly": "毎週", "monthly": "毎月"}
 
 TITLE_MAX = 100
 CONTENT_MAX = 2000
@@ -162,6 +164,7 @@ def validate_form(form):
         "due_date": form.get("due_date", "").strip(),
         "category": form.get("category", "other"),
         "priority": form.get("priority", "medium"),
+        "repeat": form.get("repeat", "none"),
     }
     errors = []
     if not data["title"]:
@@ -176,7 +179,75 @@ def validate_form(form):
         errors.append("カテゴリを選択してください。")
     if data["priority"] not in PRIORITIES:
         errors.append("優先度を選択してください。")
+    if data["repeat"] not in REPEATS:
+        errors.append("繰り返しを選択してください。")
+    elif data["repeat"] != "none" and not data["due_date"]:
+        errors.append("繰り返しにする場合は期日を入力してください。")
     return data, errors
+
+
+def add_months(value, months, day):
+    """months か月後の day 日を返す。その日が無い月は月末にする（1/31 → 2/28）。"""
+    year, month = divmod(value.month - 1 + months, 12)
+    year += value.year
+    month += 1
+    return date(year, month, min(day, calendar.monthrange(year, month)[1]))
+
+
+def next_due_date(due, repeat, today, anchor_day=None):
+    """繰り返しの次回の期日を返す。遅れて完了した場合は今日以降まで進める。
+
+    anchor_day: 毎月の基準日。月末に丸めた後も元の日（31日など）へ戻せるようにする。
+    """
+    if repeat in ("daily", "weekly"):
+        step = 1 if repeat == "daily" else 7
+        candidate = due + timedelta(days=step)
+        if candidate < today:
+            behind = (today - candidate).days
+            candidate += timedelta(days=-(-behind // step) * step)
+        return candidate
+    if repeat == "monthly":
+        day = anchor_day or due.day
+        months = 1
+        candidate = add_months(due, months, day)
+        while candidate < today:
+            months += 1
+            candidate = add_months(due, months, day)
+        return candidate
+    return None
+
+
+def create_next_occurrence(repo, todo, today, stamp):
+    """繰り返しTodoの次の回を作る。すでに後の回があれば作らない（重複防止）。"""
+    due = parse_date(todo.get("due_date"))
+    if todo.get("repeat") not in REPEATS or todo["repeat"] == "none" or due is None:
+        return None
+    series_id = todo["series_id"]
+    series_dues = [
+        d
+        for t in repo.list()
+        if t.get("series_id") == series_id
+        for d in [parse_date(t.get("due_date"))]
+        if d
+    ]
+    if any(d > due for d in series_dues):
+        return None
+    anchor_day = min(series_dues).day if series_dues else due.day
+    next_todo = {
+        "id": uuid.uuid4().hex,
+        "title": todo["title"],
+        "content": todo.get("content", ""),
+        "due_date": next_due_date(due, todo["repeat"], today, anchor_day).isoformat(),
+        "category": todo.get("category", "other"),
+        "priority": todo.get("priority", "medium"),
+        "completed": False,
+        "created_at": stamp,
+        "updated_at": stamp,
+        "repeat": todo["repeat"],
+        "series_id": series_id,
+    }
+    repo.add(next_todo)
+    return next_todo
 
 
 def decorate(todo, today):
@@ -188,6 +259,17 @@ def decorate(todo, today):
     todo["is_due_today"] = bool(due and due == today and not todo["completed"])
     todo["category_label"] = CATEGORIES.get(todo.get("category"), "その他")
     todo["priority_label"] = PRIORITIES.get(todo.get("priority"), "中")
+    repeat = todo.get("repeat", "none")
+    todo["repeat_label"] = REPEATS[repeat] if repeat in REPEATS and repeat != "none" else ""
+    return todo
+
+
+def apply_series_id(todo):
+    """繰り返しありなら系列IDを持たせ、なしなら外す。"""
+    if todo.get("repeat", "none") == "none":
+        todo["series_id"] = ""
+    elif not todo.get("series_id"):
+        todo["series_id"] = uuid.uuid4().hex
     return todo
 
 
@@ -221,6 +303,7 @@ def register_routes(app):
             "csrf_token": csrf_token,
             "CATEGORIES": CATEGORIES,
             "PRIORITIES": PRIORITIES,
+            "REPEATS": REPEATS,
         }
 
     @app.before_request
@@ -325,11 +408,19 @@ def register_routes(app):
                 "created_at": stamp,
                 "updated_at": stamp,
             }
+            apply_series_id(todo)
             get_repo().add(todo)
             flash(f"「{todo['title']}」を登録しました。", "success")
             return redirect(url_for("index"))
 
-        blank = {"title": "", "content": "", "due_date": "", "category": "other", "priority": "medium"}
+        blank = {
+            "title": "",
+            "content": "",
+            "due_date": "",
+            "category": "other",
+            "priority": "medium",
+            "repeat": "none",
+        }
         return render_template("form.html", todo=blank, errors=[], mode="new")
 
     @app.route("/todos/<todo_id>/edit", methods=["GET", "POST"])
@@ -347,6 +438,7 @@ def register_routes(app):
                     400,
                 )
             todo.update(data)
+            apply_series_id(todo)
             todo["updated_at"] = now_local().strftime("%Y-%m-%d %H:%M:%S")
             if not repo.update(todo):
                 abort(404)
@@ -362,9 +454,18 @@ def register_routes(app):
         if todo is None:
             abort(404)
         todo["completed"] = not todo["completed"]
-        todo["updated_at"] = now_local().strftime("%Y-%m-%d %H:%M:%S")
+        stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+        todo["updated_at"] = stamp
+        apply_series_id(todo)
         repo.update(todo)
         message = "完了にしました。" if todo["completed"] else "未完了に戻しました。"
+        # 繰り返しTodoを完了にしたら次の回を作る（未完了に戻しても次の回は消さない）
+        next_todo = None
+        if todo["completed"]:
+            next_todo = create_next_occurrence(repo, todo, today_local(), stamp)
+        if next_todo:
+            due = parse_date(next_todo["due_date"])
+            message += f"次回（{due.month}月{due.day}日）のTodoを作成しました。"
         flash(f"「{todo['title']}」を{message}", "success")
         return redirect(safe_next_url())
 

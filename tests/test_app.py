@@ -1,10 +1,10 @@
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from app import create_app
+from app import create_app, next_due_date
 from storage import COLUMNS, MemoryTodoRepository, SheetsTodoRepository
 
 
@@ -108,6 +108,8 @@ def test_create_without_due_date(client, repo):
         ({"due_date": "2026-13-40"}, "期日の形式"),
         ({"category": "unknown"}, "カテゴリを選択"),
         ({"priority": "urgent"}, "優先度を選択"),
+        ({"repeat": "yearly"}, "繰り返しを選択"),
+        ({"repeat": "weekly", "due_date": ""}, "繰り返しにする場合は期日を入力"),
     ],
 )
 def test_create_validation(client, repo, overrides, message):
@@ -371,9 +373,13 @@ def test_session_cookie_flags(anon_client):
 
 
 class FakeWorksheet:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, col_count=26):
         self.rows = rows if rows is not None else []
         self.input_options = []
+        self.col_count = col_count
+
+    def add_cols(self, n):
+        self.col_count += n
 
     def row_values(self, n):
         return list(self.rows[n - 1]) if n <= len(self.rows) else []
@@ -452,3 +458,148 @@ def test_secure_cookie_on_render(monkeypatch):
     monkeypatch.setenv("RENDER", "true")
     app = create_app(repository=MemoryTodoRepository())
     assert app.config["SESSION_COOKIE_SECURE"] is True
+
+
+# ---------- 繰り返しTodo ----------
+
+OLD_COLUMNS = COLUMNS[:9]  # 繰り返し機能を追加する前のヘッダー
+
+
+@pytest.mark.parametrize(
+    "due, repeat, today_, anchor, expected",
+    [
+        ("2030-05-10", "daily", "2030-05-10", None, "2030-05-11"),
+        ("2030-05-10", "weekly", "2030-05-10", None, "2030-05-17"),
+        ("2030-05-10", "monthly", "2030-05-10", None, "2030-06-10"),
+        ("2030-12-15", "monthly", "2030-12-15", None, "2031-01-15"),
+        # その日が無い月は月末、翌月は基準日（31日）に戻る
+        ("2030-01-31", "monthly", "2030-01-31", None, "2030-02-28"),
+        ("2032-01-31", "monthly", "2032-01-31", None, "2032-02-29"),
+        ("2030-02-28", "monthly", "2030-02-28", 31, "2030-03-31"),
+        # 遅れて完了したら今日以降の最初の回まで進める（曜日・日付は保つ）
+        ("2030-05-01", "daily", "2030-05-10", None, "2030-05-10"),
+        ("2030-05-06", "weekly", "2030-05-21", None, "2030-05-27"),
+        ("2030-01-15", "monthly", "2030-04-20", None, "2030-05-15"),
+    ],
+)
+def test_next_due_date(due, repeat, today_, anchor, expected):
+    result = next_due_date(date.fromisoformat(due), repeat, date.fromisoformat(today_), anchor)
+    assert result == date.fromisoformat(expected)
+
+
+def toggle(client, todo_id):
+    return client.post(
+        f"/todos/{todo_id}/toggle", data={"csrf_token": get_csrf(client)}, follow_redirects=True
+    )
+
+
+def test_create_repeat_todo(client, repo):
+    html = create_todo(client, repeat="weekly").get_data(as_text=True)
+    assert "🔁 毎週" in html
+    todo = repo.list()[0]
+    assert todo["repeat"] == "weekly"
+    assert re.fullmatch(r"[0-9a-f]{32}", todo["series_id"])
+
+
+def test_complete_repeat_creates_next_once(client, repo):
+    due = today() + timedelta(days=3)
+    create_todo(client, repeat="weekly", due_date=due.isoformat())
+    first = repo.list()[0]
+
+    html = toggle(client, first["id"]).get_data(as_text=True)
+    next_due = due + timedelta(days=7)
+    assert f"次回（{next_due.month}月{next_due.day}日）のTodoを作成しました" in html
+
+    todos = repo.list()
+    assert len(todos) == 2
+    new = next(t for t in todos if t["id"] != first["id"])
+    assert new["due_date"] == next_due.isoformat()
+    assert new["completed"] is False
+    for key in ("title", "content", "category", "priority", "repeat", "series_id"):
+        assert new[key] == first[key]
+
+    # 未完了に戻しても次の回は残り、もう一度完了にしても増えない
+    toggle(client, first["id"])
+    assert len(repo.list()) == 2
+    html = toggle(client, first["id"]).get_data(as_text=True)
+    assert "次回" not in html
+    assert len(repo.list()) == 2
+
+
+def test_complete_late_repeat_rolls_forward(client, repo):
+    create_todo(client, repeat="daily", due_date=(today() - timedelta(days=5)).isoformat())
+    toggle(client, repo.list()[0]["id"])
+    new = next(t for t in repo.list() if not t["completed"])
+    assert new["due_date"] == today().isoformat()
+
+
+def test_monthly_series_keeps_anchor_day(client, repo):
+    stamp = "2026-09-25 10:00:00"
+    repo.add({
+        "id": "m1", "title": "家賃の振込", "content": "", "due_date": "2030-01-31",
+        "category": "home", "priority": "high", "completed": False,
+        "created_at": stamp, "updated_at": stamp, "repeat": "monthly", "series_id": "s" * 32,
+    })
+    toggle(client, "m1")
+    feb = next(t for t in repo.list() if not t["completed"])
+    assert feb["due_date"] == "2030-02-28"
+    toggle(client, feb["id"])
+    mar = next(t for t in repo.list() if not t["completed"])
+    assert mar["due_date"] == "2030-03-31"
+
+
+def test_complete_normal_todo_does_not_repeat(client, repo):
+    create_todo(client)
+    html = toggle(client, repo.list()[0]["id"]).get_data(as_text=True)
+    assert "次回" not in html
+    assert len(repo.list()) == 1
+
+
+def test_edit_repeat_sets_and_clears_series(client, repo):
+    create_todo(client)
+    todo = repo.list()[0]
+    assert todo["series_id"] == ""
+    form = {k: todo[k] for k in ("title", "content", "due_date", "category", "priority")}
+
+    client.post(
+        f"/todos/{todo['id']}/edit",
+        data={**form, "repeat": "monthly", "csrf_token": get_csrf(client, f"/todos/{todo['id']}/edit")},
+    )
+    edited = repo.get(todo["id"])
+    assert edited["repeat"] == "monthly"
+    assert re.fullmatch(r"[0-9a-f]{32}", edited["series_id"])
+    assert 'value="monthly" selected' in client.get(f"/todos/{todo['id']}/edit").get_data(as_text=True)
+
+    client.post(
+        f"/todos/{todo['id']}/edit",
+        data={**form, "repeat": "none", "csrf_token": get_csrf(client, f"/todos/{todo['id']}/edit")},
+    )
+    assert repo.get(todo["id"])["repeat"] == "none"
+    assert repo.get(todo["id"])["series_id"] == ""
+
+
+def test_sheets_old_header_is_extended_without_touching_data():
+    old_row = ["old1", "既存のTodo", "メモ", "2026-10-01", "salon", "high", "FALSE",
+               "2026-09-01 09:00:00", "2026-09-01 09:00:00"]
+    ws = FakeWorksheet(rows=[list(OLD_COLUMNS), list(old_row)], col_count=9)
+    repo = make_sheets_repo(ws)
+
+    assert ws.rows[0] == COLUMNS
+    assert ws.col_count >= len(COLUMNS)
+    assert ws.rows[1] == old_row  # データ行は書き換えない
+    todo = repo.get("old1")
+    assert todo["title"] == "既存のTodo"
+    assert todo["repeat"] == "none"
+    assert todo["series_id"] == ""
+
+    # 既存Todoを繰り返しにして保存すると、新しい列にも書き込まれる
+    todo.update(repeat="weekly", series_id="a" * 32)
+    assert repo.update(todo) is True
+    assert ws.rows[1][len(OLD_COLUMNS):] == ["weekly", "a" * 32]
+    assert set(ws.input_options) == {"RAW"}
+
+
+def test_sheets_unknown_extra_header_is_rejected():
+    ws = FakeWorksheet(rows=[list(OLD_COLUMNS) + ["memo"]])
+    with pytest.raises(RuntimeError):
+        make_sheets_repo(ws)

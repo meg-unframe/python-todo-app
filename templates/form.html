@@ -47,6 +47,16 @@
       </div>
     </div>
 
+    <div class="field">
+      <label for="repeat">繰り返し</label>
+      <select id="repeat" name="repeat" aria-describedby="repeat-help">
+        {% for key, label in REPEATS.items() %}
+          <option value="{{ key }}" {% if (todo.repeat or 'none') == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <p id="repeat-help" class="field-help">完了にすると、次の回のTodoが自動で作られます（期日が必要です）。</p>
+    </div>
+
     <div class="form-actions">
       <a class="btn" href="{{ url_for('index') }}">キャンセル</a>
       <button class="btn btn-primary" type="submit">{{ '登録する' if mode == 'new' else '更新する' }}</button>

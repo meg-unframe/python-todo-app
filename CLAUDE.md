@@ -23,9 +23,10 @@
 - 期限切れ・今日が期日の表示
 - スマホでも見やすい日本語画面（レスポンシブ）
 - パスワードログイン（APP_PASSWORD。5回失敗で15分ロック）
+- 繰り返しTodo（毎日 / 毎週 / 毎月）。完了にすると次の回を自動作成する（詳細は下記）
 
 ### スプレッドシートの列（1行目がヘッダー）
-`id, title, content, due_date, category, priority, completed, created_at, updated_at`
+`id, title, content, due_date, category, priority, completed, created_at, updated_at, repeat, series_id`
 
 - `id`: UUID（32桁の16進文字列）
 - `due_date`: `YYYY-MM-DD`（空欄可）
@@ -33,6 +34,17 @@
 - `priority`: `high` / `medium` / `low`
 - `completed`: `TRUE` / `FALSE`
 - `created_at` / `updated_at`: `YYYY-MM-DD HH:MM:SS`（APP_TIMEZONE の時刻）
+- `repeat`: `none` / `daily` / `weekly` / `monthly`（空欄は `none` 扱い）
+- `series_id`: 繰り返しの系列ID（32桁の16進文字列。繰り返しなしは空欄）
+- 列は必ず末尾に追加する（既存の列の順番は変えない）。1行目が旧バージョンのヘッダー（`COLUMNS` の先頭部分）なら、起動後の最初のアクセスで足りない列名だけ自動で書き足す。データ行は書き換えない。
+
+### 繰り返しTodoの仕様
+- 繰り返しにする場合は期日が必須。
+- 完了にしたときに次の回を1件作る（タイトル・内容・カテゴリ・優先度・繰り返し・`series_id` を引き継ぐ）。
+- 次の期日: 毎日 +1日、毎週 +7日、毎月は翌月の同じ日（無い日は月末。基準日は系列で最も早い期日の「日」なので 1/31 → 2/28 → 3/31）。
+- 遅れて完了した場合は、今日以降の最初の回まで進める。
+- 同じ系列に後の期日のTodoがすでにあれば作らない（完了↔未完了を繰り返しても増えない）。未完了に戻しても次の回は消さない。
+- 編集で繰り返しを「なし」にすると `series_id` を外す。
 
 ## 技術構成
 - Python 3.11+ / Flask / Jinja2 / HTML / CSS
@@ -105,7 +117,7 @@ Google未設定で画面だけ確認したい場合は `.env` で `STORAGE_BACKE
 python -m pytest -v
 ```
 テストはメモリ保存で実行するため、Googleの認証情報は不要。
-登録・一覧・編集・完了切替・削除・入力チェック・期限切れ表示・期日順・CSRF・ログイン（ロック、ログアウト、外部URLへのリダイレクト防止）を確認する。
+登録・一覧・編集・完了切替・削除・入力チェック・期限切れ表示・期日順・CSRF・ログイン（ロック、ログアウト、外部URLへのリダイレクト防止）・繰り返し（次回日付の計算、次の回の作成と重複防止）・旧ヘッダーのシートの自動拡張を確認する。
 
 ## 公開方法（Render）
 1. GitHub（public リポジトリ `meg-unframe/python-todo-app`）へ push する。`.env` と鍵JSONが含まれていないことを `git status` で確認する。
@@ -118,3 +130,4 @@ python -m pytest -v
    - `STORAGE_BACKEND=sheets`、`SPREADSHEET_ID`、`WORKSHEET_NAME=todos`、`APP_TIMEZONE=Asia/Tokyo`
    - 認証情報は Secret Files に `credentials.json` をアップロードし、`GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/credentials.json` を設定する（`GOOGLE_CREDENTIALS_JSON` に中身を入れる方法でも可）。
 6. デプロイ後、ログイン → 登録 → 編集 → 完了切替 → 削除を確認する。
+7. 列を追加するバージョンをデプロイする前に、スプレッドシートを「ファイル → コピーを作成」でバックアップする。

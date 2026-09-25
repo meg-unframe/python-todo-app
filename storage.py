@@ -14,6 +14,9 @@ COLUMNS = [
     "completed",
     "created_at",
     "updated_at",
+    # 以降は後から追加した列（既存シートのヘッダーは自動で書き足す）
+    "repeat",
+    "series_id",
 ]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -29,6 +32,7 @@ def _from_sheet_row(row):
     row = list(row) + [""] * (len(COLUMNS) - len(row))
     todo = dict(zip(COLUMNS, row[: len(COLUMNS)]))
     todo["completed"] = str(todo["completed"]).strip().upper() == "TRUE"
+    todo["repeat"] = todo["repeat"].strip() or "none"
     return todo
 
 
@@ -82,13 +86,21 @@ class SheetsTodoRepository:
 
     def _ensure_header(self):
         header = self._ws.row_values(1)
-        if header[: len(COLUMNS)] != COLUMNS:
-            if any(header):
-                raise RuntimeError(
-                    "スプレッドシートの1行目が想定と異なります。"
-                    f"次の列名にしてください: {', '.join(COLUMNS)}"
-                )
-            self._ws.update(range_name="A1", values=[COLUMNS], value_input_option="RAW")
+        if header[: len(COLUMNS)] == COLUMNS:
+            return
+        # 旧バージョンのヘッダー（COLUMNS の先頭部分）なら、足りない列名だけ書き足す。
+        # データ行には触れないので、既存のTodoは新しい列が空欄のまま読み込まれる。
+        filled = list(header)
+        while filled and not filled[-1]:
+            filled.pop()
+        if filled != COLUMNS[: len(filled)]:
+            raise RuntimeError(
+                "スプレッドシートの1行目が想定と異なります。"
+                f"次の列名にしてください: {', '.join(COLUMNS)}"
+            )
+        if self._ws.col_count < len(COLUMNS):
+            self._ws.add_cols(len(COLUMNS) - self._ws.col_count)
+        self._ws.update(range_name="A1", values=[COLUMNS], value_input_option="RAW")
 
     def _row_range(self, row_number):
         last_col = chr(ord("A") + len(COLUMNS) - 1)
