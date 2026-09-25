@@ -6,6 +6,7 @@ import pytest
 
 from app import create_app, next_due_date
 from calendar_sync import CalendarError, GoogleCalendarSync, create_calendar_from_env
+from notifier import TEXT_MAX, LineNotifier, NotifyError, build_message, create_notifier_from_env
 from storage import COLUMNS, MemoryTodoRepository, SheetsTodoRepository
 
 
@@ -860,3 +861,218 @@ def test_google_calendar_errors_raise_calendar_error(response):
     sync = GoogleCalendarSync("cal", session=FakeSession(response))
     with pytest.raises(CalendarError):
         sync.create(SAMPLE_TODO)
+
+
+# ---------- LINE通知 ----------
+
+NOTIFY_TOKEN = "n" * 40
+NOTIFY_HEADERS = {"Authorization": f"Bearer {NOTIFY_TOKEN}"}
+
+
+class FakeNotifier:
+    """LineNotifier の代わり。送った本文を記録する。"""
+
+    def __init__(self):
+        self.sent = []
+        self.fail = False
+
+    def push(self, text):
+        if self.fail:
+            raise NotifyError("テスト用の失敗")
+        self.sent.append(text)
+
+
+@pytest.fixture
+def line():
+    return FakeNotifier()
+
+
+@pytest.fixture
+def notify_app(repo, line):
+    return create_app(
+        repository=repo,
+        config={"TESTING": True, "NOTIFY_TOKEN": NOTIFY_TOKEN, "APP_BASE_URL": "https://todo.example"},
+        calendar=None,
+        notifier=line,
+    )
+
+
+def add_todo(repo, todo_id, title, due, completed=False, **extra):
+    stamp = "2026-09-01 09:00:00"
+    repo.add({"id": todo_id, "title": title, "content": "", "category": "salon",
+              "priority": "medium", "completed": completed, "created_at": stamp,
+              "updated_at": stamp, "due_date": due.isoformat() if due else "", **extra})
+
+
+def test_notify_sends_today_tomorrow_and_overdue(notify_app, repo, line):
+    t = today()
+    add_todo(repo, "a", "期限切れの請求書", t - timedelta(days=2))
+    add_todo(repo, "b", "今日の予約確認", t)
+    add_todo(repo, "c", "明日の仕入れ", t + timedelta(days=1))
+    add_todo(repo, "d", "来週の準備", t + timedelta(days=5))
+    add_todo(repo, "e", "完了済みの期限切れ", t - timedelta(days=1), completed=True)
+    add_todo(repo, "f", "完了済みの今日", t, completed=True)
+    add_todo(repo, "g", "期日なし", None)
+
+    res = notify_app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.status_code == 200
+    assert res.get_json() == {"status": "sent", "count": 3, "overdue": 1, "today": 1, "tomorrow": 1}
+
+    assert len(line.sent) == 1
+    text = line.sent[0]
+    assert f"（{t.month}月{t.day}日）" in text
+    overdue_day = t - timedelta(days=2)
+    assert "⚠️ 期限切れ 1件" in text
+    assert f"・期限切れの請求書（{overdue_day.month}/{overdue_day.day}・サロン）" in text
+    assert "📅 今日まで 1件\n・今日の予約確認（サロン）" in text
+    assert "🔜 明日まで 1件\n・明日の仕入れ（サロン）" in text
+    assert text.endswith("https://todo.example")
+    for title in ("来週の準備", "完了済み", "期日なし"):
+        assert title not in text
+
+    # 通知したTodoだけ通知日を記録し、同じ日にもう一度呼ばれても送らない
+    assert {t_["id"] for t_ in repo.list() if t_.get("notified_on")} == {"a", "b", "c"}
+    res = notify_app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.get_json()["status"] == "no_targets"
+    assert len(line.sent) == 1
+
+
+def test_notify_overdue_again_next_day(notify_app, repo, line):
+    yesterday = (today() - timedelta(days=1)).isoformat()
+    add_todo(repo, "a", "期限切れの請求書", today() - timedelta(days=3), notified_on=yesterday)
+    res = notify_app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.get_json()["count"] == 1
+    assert "期限切れの請求書" in line.sent[0]
+
+
+def test_notify_no_targets_sends_nothing(notify_app, repo, line):
+    add_todo(repo, "d", "来週の準備", today() + timedelta(days=5))
+    add_todo(repo, "e", "完了済み", today(), completed=True)
+    res = notify_app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.status_code == 200
+    assert res.get_json() == {"status": "no_targets", "count": 0}
+    assert line.sent == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Authorization": "Bearer wrong-token"},
+        {"Authorization": f"Bearer {NOTIFY_TOKEN}x"},
+        {"Authorization": NOTIFY_TOKEN},
+        {"Authorization": f"Basic {NOTIFY_TOKEN}"},
+    ],
+)
+def test_notify_rejects_bad_token(notify_app, repo, line, headers):
+    add_todo(repo, "b", "今日の予約確認", today())
+    res = notify_app.test_client().post("/tasks/notify-due", headers=headers)
+    assert res.status_code == 401
+    assert res.get_json() == {"status": "unauthorized"}
+    assert line.sent == []
+    assert "notified_on" not in repo.get("b")
+
+
+@pytest.mark.parametrize("token", ["", "short-token"])
+def test_notify_disabled_without_long_token(repo, line, token):
+    app = create_app(repository=repo, config={"TESTING": True, "NOTIFY_TOKEN": token},
+                     calendar=None, notifier=line)
+    add_todo(repo, "b", "今日の予約確認", today())
+    res = app.test_client().post("/tasks/notify-due", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+    assert line.sent == []
+
+
+def test_notify_requires_post(notify_app):
+    res = notify_app.test_client().get("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.status_code == 405
+
+
+def test_notify_line_failure(notify_app, repo, line):
+    add_todo(repo, "b", "今日の予約確認", today())
+    line.fail = True
+    res = notify_app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.status_code == 502
+    assert res.get_json() == {"status": "line_error"}
+    # 送れなかったので通知日は記録せず、次回また送る
+    assert "notified_on" not in repo.get("b")
+
+
+def test_notify_not_configured(repo):
+    app = create_app(repository=repo, config={"TESTING": True, "NOTIFY_TOKEN": NOTIFY_TOKEN},
+                     calendar=None, notifier=None)
+    res = app.test_client().post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.status_code == 503
+
+
+def test_notifier_disabled_without_env(monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    monkeypatch.setenv("LINE_USER_ID", "")
+    assert create_notifier_from_env() is None
+
+
+def test_notify_other_pages_still_require_login(notify_app):
+    res = notify_app.test_client().get("/", headers=NOTIFY_HEADERS)
+    assert res.status_code == 302
+    assert "/login" in res.headers["Location"]
+
+
+def test_notify_does_not_break_repeat_and_calendar(repo, line, cal):
+    app = create_app(repository=repo, config={"TESTING": True, "NOTIFY_TOKEN": NOTIFY_TOKEN},
+                     calendar=cal, notifier=line)
+    c = app.test_client()
+    assert login(c).status_code == 302
+    create_todo(c, repeat="weekly", due_date=today().isoformat())
+    res = c.post("/tasks/notify-due", headers=NOTIFY_HEADERS)
+    assert res.get_json()["today"] == 1
+    todo = repo.list()[0]
+    assert todo["calendar_event_id"] == "ev1"
+    assert cal.calls == ["create"]  # 通知ではカレンダーを変更しない
+
+    toggle(c, todo["id"])
+    new = next(t for t in repo.list() if t["id"] != todo["id"])
+    assert new["due_date"] == (today() + timedelta(days=7)).isoformat()
+    assert new.get("notified_on", "") == ""
+
+
+def test_build_message_is_truncated():
+    t = today()
+    many = [{"title": "あ" * 90, "due": t, "category_label": "サロン"} for _ in range(100)]
+    text = build_message([], many, [], t)
+    assert len(text) <= TEXT_MAX
+    assert text.endswith("（以下省略）")
+
+
+# ---------- LineNotifier（LINE APIの代わりに偽の通信を使用） ----------
+
+
+class FakeLineSession:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def test_line_notifier_push():
+    session = FakeLineSession(FakeResponse(200))
+    LineNotifier("dummy-access-token", "U0123", session=session).push("こんにちは")
+    call = session.calls[0]
+    assert call["url"] == "https://api.line.me/v2/bot/message/push"
+    assert call["headers"]["Authorization"] == "Bearer dummy-access-token"
+    assert re.fullmatch(r"[0-9a-f-]{36}", call["headers"]["X-Line-Retry-Key"])
+    assert call["json"] == {"to": "U0123", "messages": [{"type": "text", "text": "こんにちは"}]}
+    assert call["timeout"]
+
+
+@pytest.mark.parametrize("response", [FakeResponse(400), FakeResponse(401), FakeResponse(500),
+                                      ConnectionError("down")])
+def test_line_notifier_errors(response):
+    notifier = LineNotifier("dummy-access-token", "U0123", session=FakeLineSession(response))
+    with pytest.raises(NotifyError) as info:
+        notifier.push("こんにちは")
+    assert "dummy-access-token" not in str(info.value)  # エラー文にトークンを含めない

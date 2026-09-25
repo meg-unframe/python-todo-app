@@ -8,5 +8,9 @@ os.environ["STORAGE_BACKEND"] = "memory"
 os.environ.setdefault("APP_TIMEZONE", "Asia/Tokyo")
 # .env にカレンダーIDがあっても、テストでは本物のカレンダーへ接続しない
 os.environ["GOOGLE_CALENDAR_ID"] = ""
+# 同じく、本物のLINEへは送らない
+os.environ["LINE_CHANNEL_ACCESS_TOKEN"] = ""
+os.environ["LINE_USER_ID"] = ""
+os.environ["NOTIFY_TOKEN"] = ""
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -18,6 +18,7 @@ COLUMNS = [
     "repeat",
     "series_id",
     "calendar_event_id",
+    "notified_on",
 ]
 
 SCOPES = [

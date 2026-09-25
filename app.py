@@ -16,6 +16,7 @@ from flask import (
     abort,
     current_app,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -25,6 +26,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from calendar_sync import create_calendar_from_env
+from notifier import build_message, create_notifier_from_env
 from storage import create_repository_from_env
 
 load_dotenv()
@@ -46,23 +48,29 @@ CONTENT_MAX = 2000
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_SECONDS = 15 * 60
 
+# 通知用エンドポイントのトークンの最低文字数（短いと総当たりで当てられるため）
+NOTIFY_TOKEN_MIN = 32
+NOTIFY_PATH = "/tasks/notify-due"
+
 
 CALENDAR_WARNING = "Googleカレンダーへの反映に失敗しました（Todoは保存済みです）。"
 
-# create_app(calendar=...) を省略したときは、環境変数から連携の設定を読む
-_CALENDAR_FROM_ENV = object()
+# create_app(calendar=..., notifier=...) を省略したときは、環境変数から連携の設定を読む
+_FROM_ENV = object()
 
 
 def _env_flag(name, default):
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
 
 
-def create_app(repository=None, config=None, calendar=_CALENDAR_FROM_ENV):
+def create_app(repository=None, config=None, calendar=_FROM_ENV, notifier=_FROM_ENV):
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", ""),
         APP_PASSWORD=os.environ.get("APP_PASSWORD", ""),
         APP_TIMEZONE=os.environ.get("APP_TIMEZONE", "Asia/Tokyo"),
+        NOTIFY_TOKEN=os.environ.get("NOTIFY_TOKEN", "").strip(),
+        APP_BASE_URL=os.environ.get("APP_BASE_URL", "").strip(),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         # Render上（HTTPS）では自動でSecure属性を付ける
@@ -92,6 +100,7 @@ def create_app(repository=None, config=None, calendar=_CALENDAR_FROM_ENV):
     # 保存先は最初のリクエスト時に接続する（起動時にGoogleへ接続しないため）
     app.extensions["todo_repository"] = repository
     app.extensions["calendar_sync"] = calendar
+    app.extensions["notifier"] = notifier
 
     register_routes(app)
     return app
@@ -111,10 +120,52 @@ def get_repo():
 def get_calendar():
     """カレンダー連携を返す。GOOGLE_CALENDAR_ID が未設定なら None（連携しない）。"""
     calendar_sync = current_app.extensions.get("calendar_sync")
-    if calendar_sync is _CALENDAR_FROM_ENV:
+    if calendar_sync is _FROM_ENV:
         calendar_sync = create_calendar_from_env()
         current_app.extensions["calendar_sync"] = calendar_sync
     return calendar_sync
+
+
+def get_notifier():
+    """LINE通知を返す。LINEのトークンか送信先が未設定なら None（通知しない）。"""
+    notifier = current_app.extensions.get("notifier")
+    if notifier is _FROM_ENV:
+        notifier = create_notifier_from_env()
+        current_app.extensions["notifier"] = notifier
+    return notifier
+
+
+def notify_token_matches(header_value):
+    """Authorization: Bearer <NOTIFY_TOKEN> を一定時間で比較する。未設定・短すぎる場合は常に拒否。"""
+    expected = current_app.config["NOTIFY_TOKEN"]
+    scheme, _, sent = (header_value or "").partition(" ")
+    if len(expected) < NOTIFY_TOKEN_MIN or scheme.lower() != "bearer":
+        return False
+    return secrets.compare_digest(
+        hashlib.sha256(sent.strip().encode()).digest(), hashlib.sha256(expected.encode()).digest()
+    )
+
+
+def select_due_notifications(todos, today):
+    """通知するTodoを (期限切れ, 今日まで, 明日まで) に分ける。
+
+    完了済み・期日なし・今日すでに通知したTodoは含めない。
+    """
+    tomorrow = today + timedelta(days=1)
+    overdue, due_today, due_tomorrow = [], [], []
+    targets = sorted(
+        (t for t in todos if t["due"] and not t["completed"]
+         and t.get("notified_on") != today.isoformat()),
+        key=sort_key_due,
+    )
+    for todo in targets:
+        if todo["due"] < today:
+            overdue.append(todo)
+        elif todo["due"] == today:
+            due_today.append(todo)
+        elif todo["due"] == tomorrow:
+            due_tomorrow.append(todo)
+    return overdue, due_today, due_tomorrow
 
 
 def sync_calendar(todo, create_missing=True):
@@ -303,6 +354,7 @@ def create_next_occurrence(repo, todo, today, stamp):
         "repeat": todo["repeat"],
         "series_id": series_id,
         "calendar_event_id": "",
+        "notified_on": "",
     }
     calendar_ok = sync_calendar(next_todo)
     repo.add(next_todo)
@@ -367,7 +419,8 @@ def register_routes(app):
 
     @app.before_request
     def check_csrf():
-        if request.method == "POST":
+        # 通知用エンドポイントは外部（cron）から呼ぶため、CSRFではなくトークンで認証する
+        if request.method == "POST" and request.endpoint != "notify_due":
             sent = request.form.get("csrf_token", "")
             expected = session.get("csrf_token", "")
             if not expected or not secrets.compare_digest(sent, expected):
@@ -375,7 +428,10 @@ def register_routes(app):
 
     @app.before_request
     def require_login():
-        if request.endpoint in ("login", "static") or session.get("logged_in"):
+        # 通知用URLは GET などでも 405 を返せるよう、パスで判定してログイン不要にする
+        if request.endpoint in ("login", "static") or request.path == NOTIFY_PATH:
+            return None
+        if session.get("logged_in"):
             return None
         return redirect(url_for("login", next=request.full_path.rstrip("?")))
 
@@ -467,6 +523,7 @@ def register_routes(app):
                 "created_at": stamp,
                 "updated_at": stamp,
                 "calendar_event_id": "",
+                "notified_on": "",
             }
             apply_series_id(todo)
             calendar_ok = sync_calendar(todo)
@@ -553,6 +610,49 @@ def register_routes(app):
                 flash("Googleカレンダーの予定を削除できませんでした。カレンダーから手動で削除してください。", "warning")
             return redirect(url_for("index"))
         return render_template("confirm_delete.html", todo=decorate(todo, today_local()))
+
+    @app.post(NOTIFY_PATH)
+    def notify_due():
+        """期限切れ・今日まで・明日までの未完了TodoをLINEへ通知する（cron-job.org から毎朝呼ぶ）。"""
+        if not notify_token_matches(request.headers.get("Authorization")):
+            return jsonify(status="unauthorized"), 401
+        notifier = get_notifier()
+        if notifier is None:
+            return jsonify(status="not_configured"), 503
+
+        repo = get_repo()
+        today = today_local()
+        todos = [decorate(t, today) for t in repo.list()]
+        overdue, due_today, due_tomorrow = select_due_notifications(todos, today)
+        targets = overdue + due_today + due_tomorrow
+        if not targets:
+            return jsonify(status="no_targets", count=0)
+
+        message = build_message(
+            overdue, due_today, due_tomorrow, today, current_app.config["APP_BASE_URL"]
+        )
+        try:
+            notifier.push(message)
+        except Exception as error:
+            current_app.logger.warning("LINE通知に失敗しました: %s", error)
+            return jsonify(status="line_error"), 502
+
+        # 同じ日に2回呼ばれても重複して送らないよう、通知した日を記録する
+        try:
+            for todo in targets:
+                saved = repo.get(todo["id"])
+                if saved:
+                    saved["notified_on"] = today.isoformat()
+                    repo.update(saved)
+        except Exception as error:  # 送信は済んでいるので成功として返す
+            current_app.logger.warning("通知日の記録に失敗しました: %s", error)
+        return jsonify(
+            status="sent",
+            count=len(targets),
+            overdue=len(overdue),
+            today=len(due_today),
+            tomorrow=len(due_tomorrow),
+        )
 
     @app.errorhandler(400)
     def bad_request(error):
