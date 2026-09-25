@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app import create_app, next_due_date
+from calendar_sync import CalendarError, GoogleCalendarSync, create_calendar_from_env
 from storage import COLUMNS, MemoryTodoRepository, SheetsTodoRepository
 
 
@@ -595,7 +596,7 @@ def test_sheets_old_header_is_extended_without_touching_data():
     # 既存Todoを繰り返しにして保存すると、新しい列にも書き込まれる
     todo.update(repeat="weekly", series_id="a" * 32)
     assert repo.update(todo) is True
-    assert ws.rows[1][len(OLD_COLUMNS):] == ["weekly", "a" * 32]
+    assert ws.rows[1][len(OLD_COLUMNS):len(OLD_COLUMNS) + 2] == ["weekly", "a" * 32]
     assert set(ws.input_options) == {"RAW"}
 
 
@@ -603,3 +604,259 @@ def test_sheets_unknown_extra_header_is_rejected():
     ws = FakeWorksheet(rows=[list(OLD_COLUMNS) + ["memo"]])
     with pytest.raises(RuntimeError):
         make_sheets_repo(ws)
+
+
+def test_sheets_header_from_repeat_version_is_extended():
+    # 繰り返し機能までの版（11列）のシートにも、カレンダー用の列だけを書き足す
+    header = COLUMNS[: COLUMNS.index("calendar_event_id")]
+    row = ["r1", "週次の売上確認", "", "2026-10-01", "salon", "high", "FALSE",
+           "2026-09-01 09:00:00", "2026-09-01 09:00:00", "weekly", "b" * 32]
+    ws = FakeWorksheet(rows=[list(header), list(row)], col_count=11)
+    repo = make_sheets_repo(ws)
+    assert ws.rows[0] == COLUMNS
+    assert ws.rows[1] == row
+    assert repo.get("r1")["calendar_event_id"] == ""
+
+
+# ---------- Googleカレンダー連携 ----------
+
+
+class FakeCalendar:
+    """GoogleCalendarSync の代わり。予定を辞書に記録する。"""
+
+    def __init__(self):
+        self.events = {}
+        self.calls = []
+        self.fail = False
+        self._next = 0
+
+    def _check(self, name):
+        self.calls.append(name)
+        if self.fail:
+            raise CalendarError("テスト用の失敗")
+
+    def create(self, todo):
+        self._check("create")
+        self._next += 1
+        event_id = f"ev{self._next}"
+        self.events[event_id] = {"summary": ("✅ " if todo["completed"] else "") + todo["title"],
+                                 "date": todo["due_date"]}
+        return event_id
+
+    def update(self, event_id, todo):
+        self._check("update")
+        self.events[event_id] = {"summary": ("✅ " if todo["completed"] else "") + todo["title"],
+                                 "date": todo["due_date"]}
+        return event_id
+
+    def delete(self, event_id):
+        self._check("delete")
+        self.events.pop(event_id, None)
+
+
+@pytest.fixture
+def cal():
+    return FakeCalendar()
+
+
+@pytest.fixture
+def cal_client(repo, cal):
+    c = create_app(repository=repo, config={"TESTING": True}, calendar=cal).test_client()
+    assert login(c).status_code == 302
+    return c
+
+
+def edit_todo(client, todo, **overrides):
+    path = f"/todos/{todo['id']}/edit"
+    data = {k: todo.get(k, "") for k in ("title", "content", "due_date", "category", "priority")}
+    data.update(repeat=todo.get("repeat", "none"), csrf_token=get_csrf(client, path))
+    data.update(overrides)
+    return client.post(path, data=data, follow_redirects=True)
+
+
+def test_calendar_event_created_on_create(cal_client, repo, cal):
+    html = create_todo(cal_client).get_data(as_text=True)
+    todo = repo.list()[0]
+    assert todo["calendar_event_id"] == "ev1"
+    assert cal.events["ev1"] == {"summary": "予約表の確認", "date": todo["due_date"]}
+    assert "📅 カレンダー" in html
+    assert "Googleカレンダーへの反映に失敗" not in html
+
+
+def test_calendar_not_used_without_due_date(cal_client, repo, cal):
+    create_todo(cal_client, due_date="")
+    assert cal.calls == []
+    assert repo.list()[0]["calendar_event_id"] == ""
+
+
+def test_calendar_event_follows_edit(cal_client, repo, cal):
+    create_todo(cal_client)
+    todo = repo.list()[0]
+    new_due = (today() + timedelta(days=10)).isoformat()
+
+    edit_todo(cal_client, todo, title="予約表の再確認", due_date=new_due)
+    assert cal.events["ev1"] == {"summary": "予約表の再確認", "date": new_due}
+
+    # 期日を消すと予定も消える
+    edit_todo(cal_client, repo.get(todo["id"]), due_date="")
+    assert cal.events == {}
+    assert repo.get(todo["id"])["calendar_event_id"] == ""
+
+    # 期日を戻すと予定を作り直す
+    edit_todo(cal_client, repo.get(todo["id"]), due_date=new_due)
+    assert repo.get(todo["id"])["calendar_event_id"] == "ev2"
+
+
+def test_calendar_created_when_editing_old_todo(cal_client, repo, cal):
+    stamp = "2026-09-01 09:00:00"
+    repo.add({"id": "old1", "title": "既存のTodo", "content": "", "due_date": "2030-01-10",
+              "category": "home", "priority": "low", "completed": False,
+              "created_at": stamp, "updated_at": stamp, "repeat": "none", "series_id": "",
+              "calendar_event_id": ""})
+    edit_todo(cal_client, repo.get("old1"))
+    assert repo.get("old1")["calendar_event_id"] == "ev1"
+
+
+def test_calendar_marks_done_on_toggle(cal_client, repo, cal):
+    create_todo(cal_client)
+    todo_id = repo.list()[0]["id"]
+    toggle(cal_client, todo_id)
+    assert cal.events["ev1"]["summary"] == "✅ 予約表の確認"
+    toggle(cal_client, todo_id)
+    assert cal.events["ev1"]["summary"] == "予約表の確認"
+
+
+def test_toggle_does_not_create_event_for_old_todo(cal_client, repo, cal):
+    stamp = "2026-09-01 09:00:00"
+    repo.add({"id": "old1", "title": "既存のTodo", "content": "", "due_date": "2030-01-10",
+              "category": "home", "priority": "low", "completed": False,
+              "created_at": stamp, "updated_at": stamp})
+    toggle(cal_client, "old1")
+    assert cal.calls == []
+
+
+def test_calendar_event_for_next_occurrence(cal_client, repo, cal):
+    create_todo(cal_client, repeat="weekly")
+    first = repo.list()[0]
+    toggle(cal_client, first["id"])
+    new = next(t for t in repo.list() if t["id"] != first["id"])
+    assert new["calendar_event_id"] == "ev2"
+    assert cal.events["ev2"] == {"summary": "予約表の確認", "date": new["due_date"]}
+    assert cal.events["ev1"]["summary"] == "✅ 予約表の確認"
+
+
+def test_calendar_event_deleted_with_todo(cal_client, repo, cal):
+    create_todo(cal_client)
+    todo_id = repo.list()[0]["id"]
+    path = f"/todos/{todo_id}/delete"
+    assert "Googleカレンダーの予定も削除されます" in cal_client.get(path).get_data(as_text=True)
+    cal_client.post(path, data={"csrf_token": get_csrf(cal_client, path)})
+    assert repo.list() == []
+    assert cal.events == {}
+
+
+def test_calendar_failure_keeps_todo(cal_client, repo, cal):
+    cal.fail = True
+    html = create_todo(cal_client).get_data(as_text=True)
+    assert "を登録しました" in html
+    assert "Googleカレンダーへの反映に失敗しました" in html
+    todo = repo.list()[0]
+    assert todo["calendar_event_id"] == ""
+
+    html = edit_todo(cal_client, todo, title="変更後").get_data(as_text=True)
+    assert repo.get(todo["id"])["title"] == "変更後"
+    assert "Googleカレンダーへの反映に失敗しました" in html
+
+
+def test_calendar_failure_on_delete_still_deletes_todo(cal_client, repo, cal):
+    create_todo(cal_client)
+    todo_id = repo.list()[0]["id"]
+    cal.fail = True
+    path = f"/todos/{todo_id}/delete"
+    html = cal_client.post(
+        path, data={"csrf_token": get_csrf(cal_client, path)}, follow_redirects=True
+    ).get_data(as_text=True)
+    assert repo.list() == []
+    assert "カレンダーから手動で削除してください" in html
+
+
+def test_calendar_disabled_without_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CALENDAR_ID", "")
+    assert create_calendar_from_env() is None
+
+
+# ---------- GoogleCalendarSync（Google APIの代わりに偽の通信を使用） ----------
+
+
+class FakeResponse:
+    def __init__(self, status_code, body=None):
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self):
+        return self._body
+
+
+class FakeSession:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def request(self, method, url, json=None, timeout=None):
+        self.requests.append({"method": method, "url": url, "json": json, "timeout": timeout})
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+SAMPLE_TODO = {"id": "t1", "title": "予約表の確認", "content": "来週分", "due_date": "2030-01-31",
+               "completed": False}
+
+
+def test_google_calendar_create_event():
+    session = FakeSession(FakeResponse(200, {"id": "abc"}))
+    sync = GoogleCalendarSync("team#home@group.calendar.google.com", session=session)
+    assert sync.create(SAMPLE_TODO) == "abc"
+
+    req = session.requests[0]
+    assert req["method"] == "POST"
+    # カレンダーIDの記号はURL用に変換する
+    assert "/calendars/team%23home%40group.calendar.google.com/events" in req["url"]
+    assert req["timeout"]
+    body = req["json"]
+    assert body["summary"] == "予約表の確認"
+    assert body["description"] == "来週分"
+    assert body["start"] == {"date": "2030-01-31"}
+    assert body["end"] == {"date": "2030-02-01"}  # 終日の予定は翌日が終了日
+    assert body["extendedProperties"]["private"]["todo_id"] == "t1"
+
+
+def test_google_calendar_update_marks_done_and_recreates_missing():
+    session = FakeSession(FakeResponse(200, {"id": "abc"}))
+    sync = GoogleCalendarSync("cal", session=session)
+    assert sync.update("abc", {**SAMPLE_TODO, "completed": True}) == "abc"
+    assert session.requests[0]["method"] == "PUT"
+    assert session.requests[0]["url"].endswith("/events/abc")
+    assert session.requests[0]["json"]["summary"] == "✅ 予約表の確認"
+    assert session.requests[0]["json"]["status"] == "confirmed"
+
+    # 予定が消されていたら作り直す
+    session = FakeSession(FakeResponse(404), FakeResponse(200, {"id": "new"}))
+    sync = GoogleCalendarSync("cal", session=session)
+    assert sync.update("gone", SAMPLE_TODO) == "new"
+    assert [r["method"] for r in session.requests] == ["PUT", "POST"]
+
+
+def test_google_calendar_delete_ignores_missing_event():
+    for status in (204, 404, 410):
+        session = FakeSession(FakeResponse(status))
+        GoogleCalendarSync("cal", session=session).delete("abc")
+        assert session.requests[0]["method"] == "DELETE"
+
+
+@pytest.mark.parametrize("response", [FakeResponse(403), FakeResponse(500), ConnectionError("down")])
+def test_google_calendar_errors_raise_calendar_error(response):
+    sync = GoogleCalendarSync("cal", session=FakeSession(response))
+    with pytest.raises(CalendarError):
+        sync.create(SAMPLE_TODO)

@@ -17,9 +17,14 @@ COLUMNS = [
     # 以降は後から追加した列（既存シートのヘッダーは自動で書き足す）
     "repeat",
     "series_id",
+    "calendar_event_id",
 ]
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    # Googleカレンダー連携（GOOGLE_CALENDAR_ID を設定したときだけ使う）
+    "https://www.googleapis.com/auth/calendar.events",
+]
 
 
 def _to_sheet_value(key, value):

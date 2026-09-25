@@ -49,6 +49,7 @@
         <span class="badge badge-cat cat-{{ todo.category }}">{{ todo.category_label }}</span>
         <span class="badge badge-pri pri-{{ todo.priority }}">優先度：{{ todo.priority_label }}</span>
         {% if todo.repeat_label %}<span class="badge badge-repeat">🔁 {{ todo.repeat_label }}</span>{% endif %}
+        {% if todo.calendar_event_id %}<span class="badge badge-cal" title="Googleカレンダーに登録済み">📅 カレンダー</span>{% endif %}
         {% if todo.is_overdue %}<span class="badge badge-overdue">期限切れ</span>{% endif %}
         {% if todo.is_due_today %}<span class="badge badge-today">今日まで</span>{% endif %}
         {% if todo.completed %}<span class="badge badge-done">完了</span>{% endif %}

@@ -24,6 +24,7 @@ from flask import (
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+from calendar_sync import create_calendar_from_env
 from storage import create_repository_from_env
 
 load_dotenv()
@@ -46,11 +47,17 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_SECONDS = 15 * 60
 
 
+CALENDAR_WARNING = "Googleカレンダーへの反映に失敗しました（Todoは保存済みです）。"
+
+# create_app(calendar=...) を省略したときは、環境変数から連携の設定を読む
+_CALENDAR_FROM_ENV = object()
+
+
 def _env_flag(name, default):
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
 
 
-def create_app(repository=None, config=None):
+def create_app(repository=None, config=None, calendar=_CALENDAR_FROM_ENV):
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", ""),
@@ -84,6 +91,7 @@ def create_app(repository=None, config=None):
 
     # 保存先は最初のリクエスト時に接続する（起動時にGoogleへ接続しないため）
     app.extensions["todo_repository"] = repository
+    app.extensions["calendar_sync"] = calendar
 
     register_routes(app)
     return app
@@ -98,6 +106,52 @@ def get_repo():
         repo = create_repository_from_env()
         current_app.extensions["todo_repository"] = repo
     return repo
+
+
+def get_calendar():
+    """カレンダー連携を返す。GOOGLE_CALENDAR_ID が未設定なら None（連携しない）。"""
+    calendar_sync = current_app.extensions.get("calendar_sync")
+    if calendar_sync is _CALENDAR_FROM_ENV:
+        calendar_sync = create_calendar_from_env()
+        current_app.extensions["calendar_sync"] = calendar_sync
+    return calendar_sync
+
+
+def sync_calendar(todo, create_missing=True):
+    """Todoの期日に合わせて予定を作成・更新・削除し、予定IDを todo に入れる。
+
+    Todoの保存を優先するため、失敗しても例外は出さず False を返す。
+    """
+    try:
+        calendar_sync = get_calendar()
+        if calendar_sync is None:
+            return True
+        event_id = todo.get("calendar_event_id") or ""
+        if parse_date(todo.get("due_date")) is None:
+            if event_id:
+                calendar_sync.delete(event_id)
+                todo["calendar_event_id"] = ""
+        elif event_id:
+            todo["calendar_event_id"] = calendar_sync.update(event_id, todo)
+        elif create_missing:
+            todo["calendar_event_id"] = calendar_sync.create(todo)
+        return True
+    except Exception as error:
+        current_app.logger.warning("カレンダー連携に失敗しました: %s", error)
+        return False
+
+
+def delete_calendar_event(todo):
+    """削除したTodoの予定を消す。失敗しても例外は出さず False を返す。"""
+    event_id = todo.get("calendar_event_id") or ""
+    try:
+        calendar_sync = get_calendar()
+        if calendar_sync is not None and event_id:
+            calendar_sync.delete(event_id)
+        return True
+    except Exception as error:
+        current_app.logger.warning("カレンダーの予定の削除に失敗しました: %s", error)
+        return False
 
 
 def now_local():
@@ -218,10 +272,13 @@ def next_due_date(due, repeat, today, anchor_day=None):
 
 
 def create_next_occurrence(repo, todo, today, stamp):
-    """繰り返しTodoの次の回を作る。すでに後の回があれば作らない（重複防止）。"""
+    """繰り返しTodoの次の回を作る。すでに後の回があれば作らない（重複防止）。
+
+    戻り値は (次の回のTodo または None, カレンダーへ反映できたか)。
+    """
     due = parse_date(todo.get("due_date"))
     if todo.get("repeat") not in REPEATS or todo["repeat"] == "none" or due is None:
-        return None
+        return None, True
     series_id = todo["series_id"]
     series_dues = [
         d
@@ -231,7 +288,7 @@ def create_next_occurrence(repo, todo, today, stamp):
         if d
     ]
     if any(d > due for d in series_dues):
-        return None
+        return None, True
     anchor_day = min(series_dues).day if series_dues else due.day
     next_todo = {
         "id": uuid.uuid4().hex,
@@ -245,9 +302,11 @@ def create_next_occurrence(repo, todo, today, stamp):
         "updated_at": stamp,
         "repeat": todo["repeat"],
         "series_id": series_id,
+        "calendar_event_id": "",
     }
+    calendar_ok = sync_calendar(next_todo)
     repo.add(next_todo)
-    return next_todo
+    return next_todo, calendar_ok
 
 
 def decorate(todo, today):
@@ -407,10 +466,14 @@ def register_routes(app):
                 "completed": False,
                 "created_at": stamp,
                 "updated_at": stamp,
+                "calendar_event_id": "",
             }
             apply_series_id(todo)
+            calendar_ok = sync_calendar(todo)
             get_repo().add(todo)
             flash(f"「{todo['title']}」を登録しました。", "success")
+            if not calendar_ok:
+                flash(CALENDAR_WARNING, "warning")
             return redirect(url_for("index"))
 
         blank = {
@@ -440,9 +503,12 @@ def register_routes(app):
             todo.update(data)
             apply_series_id(todo)
             todo["updated_at"] = now_local().strftime("%Y-%m-%d %H:%M:%S")
+            calendar_ok = sync_calendar(todo)
             if not repo.update(todo):
                 abort(404)
             flash(f"「{todo['title']}」を更新しました。", "success")
+            if not calendar_ok:
+                flash(CALENDAR_WARNING, "warning")
             return redirect(url_for("index"))
 
         return render_template("form.html", todo=todo, errors=[], mode="edit")
@@ -457,16 +523,21 @@ def register_routes(app):
         stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
         todo["updated_at"] = stamp
         apply_series_id(todo)
+        # 予定があればタイトルの ✅ を付け外しする（予定が無い古いTodoには作らない）
+        calendar_ok = sync_calendar(todo, create_missing=False)
         repo.update(todo)
         message = "完了にしました。" if todo["completed"] else "未完了に戻しました。"
         # 繰り返しTodoを完了にしたら次の回を作る（未完了に戻しても次の回は消さない）
         next_todo = None
         if todo["completed"]:
-            next_todo = create_next_occurrence(repo, todo, today_local(), stamp)
+            next_todo, next_calendar_ok = create_next_occurrence(repo, todo, today_local(), stamp)
+            calendar_ok = calendar_ok and next_calendar_ok
         if next_todo:
             due = parse_date(next_todo["due_date"])
             message += f"次回（{due.month}月{due.day}日）のTodoを作成しました。"
         flash(f"「{todo['title']}」を{message}", "success")
+        if not calendar_ok:
+            flash(CALENDAR_WARNING, "warning")
         return redirect(safe_next_url())
 
     @app.route("/todos/<todo_id>/delete", methods=["GET", "POST"])
@@ -478,6 +549,8 @@ def register_routes(app):
         if request.method == "POST":
             repo.delete(todo_id)
             flash(f"「{todo['title']}」を削除しました。", "success")
+            if not delete_calendar_event(todo):
+                flash("Googleカレンダーの予定を削除できませんでした。カレンダーから手動で削除してください。", "warning")
             return redirect(url_for("index"))
         return render_template("confirm_delete.html", todo=decorate(todo, today_local()))
 

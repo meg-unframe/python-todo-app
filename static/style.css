@@ -85,6 +85,7 @@ main.container { padding-top: 16px; padding-bottom: 48px; }
 /* メッセージ */
 .flash { padding: 10px 14px; border-radius: var(--radius); margin: 0 0 12px; }
 .flash-success { background: var(--success-bg); color: var(--primary-dark); }
+.flash-warning { background: var(--warn-bg); color: #7a5214; }
 .errors { background: var(--danger-bg); color: var(--danger); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 16px; }
 .errors ul { margin: 0; padding-left: 1.2em; }
 
@@ -189,6 +190,7 @@ select:focus, input:focus, textarea:focus { outline: 2px solid var(--primary); o
 .badge-today { background: var(--warn); color: #fff; }
 .badge-done { background: var(--primary); color: #fff; }
 .badge-repeat { background: #efe9f7; color: #6a4a9c; }
+.badge-cal { background: #e5edfb; color: #2f5aa3; }
 
 .empty { text-align: center; padding: 40px 16px; background: var(--surface); border-radius: var(--radius); border: 1px dashed var(--border); }
 

@@ -7,7 +7,7 @@
     <p class="todo-title">{{ todo.title }}</p>
     <p class="muted">{{ todo.category_label }} ／ 優先度：{{ todo.priority_label }}{% if todo.due %} ／ 期日：{{ todo.due.year }}年{{ todo.due.month }}月{{ todo.due.day }}日{% endif %}</p>
   </div>
-  <p class="muted">削除すると元に戻せません。</p>
+  <p class="muted">削除すると元に戻せません。{% if todo.calendar_event_id %}Googleカレンダーの予定も削除されます。{% endif %}</p>
   <form method="post" class="form-actions">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <a class="btn" href="{{ url_for('index') }}">キャンセル</a>
